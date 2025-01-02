@@ -1,4 +1,4 @@
-package gc
+package cleanup
 
 import (
 	"context"
@@ -17,9 +17,17 @@ const cleanupPeriod = 5 * time.Minute // TODO: make it configurable
 var ticker = time.NewTicker(cleanupPeriod)
 
 type Cleaner struct {
-	fs   afero.Afero
-	path metadata.PathResolver
+	fs      afero.Afero
 	mounter mount.Interface
+	path    metadata.PathResolver
+}
+
+func New(fs afero.Afero, path metadata.PathResolver) *Cleaner {
+	return &Cleaner{
+		fs:      fs,
+		path:    path,
+		mounter: mount.New(""),
+	}
 }
 
 func (c Cleaner) Run(ctx context.Context) error {
@@ -29,7 +37,7 @@ func (c Cleaner) Run(ctx context.Context) error {
 
 		defer ticker.Reset(cleanupPeriod)
 	default:
-		log.Info("skipping CSI filesystem cleanup, it only runs every given period", "period", cleanupPeriod)
+		log.Info("skipping CSI filesystem cleanup, it only runs every given period", "period", cleanupPeriod.String())
 
 		return nil
 	}
@@ -59,9 +67,19 @@ func (c Cleaner) Run(ctx context.Context) error {
 
 		_, err = c.fs.Stat(latestBinDir)
 		if err == nil {
-			relevantBinDirs = append(relevantBinDirs, latestBinDir)
-
 			continue
+		}
+
+		linker, ok := c.fs.Fs.(afero.LinkReader)
+		if ok {
+			actualPath, err := linker.ReadlinkIfPossible(latestBinDir)
+			if err != nil {
+				log.Error(err, "failed to follow symlink", "path", latestBinDir)
+
+				continue
+			}
+
+			relevantBinDirs = append(relevantBinDirs, actualPath)
 		}
 	}
 
