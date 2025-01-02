@@ -3,24 +3,45 @@ package gc
 import (
 	"context"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/Dynatrace/dynatrace-operator/pkg/controllers/csi/metadata"
 	"github.com/spf13/afero"
+	"golang.org/x/exp/maps"
+	"k8s.io/mount-utils"
 )
+
+const cleanupPeriod = 5 * time.Minute // TODO: make it configurable
+
+var ticker = time.NewTicker(cleanupPeriod)
 
 type Cleaner struct {
 	fs   afero.Afero
 	path metadata.PathResolver
+	mounter mount.Interface
 }
 
 func (c Cleaner) Run(ctx context.Context) error {
+	select {
+	case <-ticker.C:
+		log.Info("running CSI filesystem cleanup")
+
+		defer ticker.Reset(cleanupPeriod)
+	default:
+		log.Info("skipping CSI filesystem cleanup, it only runs every given period", "period", cleanupPeriod)
+
+		return nil
+	}
+
 	rootSubDirs, err := c.fs.ReadDir(c.path.RootDir)
 	if err != nil {
 		return err
 	}
 
-	var deprecatedDirNames []string
-	var relevantDirNames []string
+	var tenantDirsWithDeprecatedFolders []string
+
+	var relevantBinDirs []string
 
 	for _, fileInfo := range rootSubDirs {
 		if !fileInfo.IsDir() || fileInfo.Name() == filepath.Base(c.path.AppMountsBaseDir()) {
@@ -29,25 +50,24 @@ func (c Cleaner) Run(ctx context.Context) error {
 
 		_, err := c.fs.Stat(c.path.AgentRunDir(fileInfo.Name()))
 		if err == nil {
-			deprecatedDirNames = append(deprecatedDirNames, fileInfo.Name())
+			tenantDirsWithDeprecatedFolders = append(tenantDirsWithDeprecatedFolders, fileInfo.Name())
 
 			continue
 		}
 
-		_, err = c.fs.Stat(c.path.LatestAgentBinaryForDynaKube(fileInfo.Name()))
+		latestBinDir := c.path.LatestAgentBinaryForDynaKube(fileInfo.Name())
+
+		_, err = c.fs.Stat(latestBinDir)
 		if err == nil {
-			relevantDirNames = append(relevantDirNames, fileInfo.Name())
+			relevantBinDirs = append(relevantBinDirs, latestBinDir)
 
 			continue
 		}
 	}
 
-	err = c.removeDeprecatedMounts(deprecatedDirNames)
-	if err != nil {
-		return err
-	}
+	c.removeDeprecatedMounts(tenantDirsWithDeprecatedFolders)
 
-	err = c.removeUnusedBinaries(relevantDirNames)
+	err = c.removeUnusedBinaries(relevantBinDirs)
 	if err != nil {
 		return err
 	}
@@ -55,7 +75,7 @@ func (c Cleaner) Run(ctx context.Context) error {
 	return nil
 }
 
-func (c Cleaner) removeDeprecatedMounts(tenantNames []string) error {
+func (c Cleaner) removeDeprecatedMounts(tenantNames []string) {
 	for _, tenant := range tenantNames {
 		runDir := c.path.AgentRunDir(tenant)
 
@@ -90,11 +110,51 @@ func (c Cleaner) removeDeprecatedMounts(tenantNames []string) error {
 			}
 		}
 	}
-
-	return nil
 }
 
-func (c Cleaner) removeUnusedBinaries(dkNames []string) error {
-	// TODO
+func (c Cleaner) removeUnusedBinaries(latestBins []string) error {
+	overlays, err := metadata.GetRelevantOverlayMounts(c.mounter, c.path.RootDir)
+	if err != nil {
+		log.Info("failed to list active overlay mounts, skipping unused binaries cleanup")
+
+		return err
+	}
+
+	keptBins := map[string]bool{}
+	for _, overlay := range overlays {
+		keptBins[overlay.LowerDir] = true
+	}
+
+	log.Info("binaries to keep because they are still mounted", "paths", strings.Join(maps.Keys(keptBins), ","))
+
+	for _, latest := range latestBins {
+		keptBins[latest] = true
+	}
+
+	log.Info("binaries to keep because they are the latest", "paths", strings.Join(latestBins, ","))
+
+	sharedBins, err := c.fs.ReadDir(c.path.AgentSharedBinaryDirBase())
+	if err != nil {
+		log.Info("failed to list the shared binaries directory, skipping unused binaries cleanup")
+
+		return err
+	}
+
+	for _, dir := range sharedBins {
+		sharedBinPath := c.path.AgentSharedBinaryDirForAgent(dir.Name())
+
+		_, ok := keptBins[sharedBinPath]
+		if !ok {
+			err := c.fs.RemoveAll(sharedBinPath)
+			if err != nil {
+				log.Error(err, "failed to remove shared binary", "path", sharedBinPath)
+
+				continue
+			}
+
+			log.Info("removed old shared binary", "path", sharedBinPath)
+		}
+	}
+
 	return nil
 }
